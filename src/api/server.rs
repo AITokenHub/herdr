@@ -1259,6 +1259,7 @@ mod tests {
             agent_session: None,
             scroll: None,
             revision: 0,
+            program_status: Vec::new(),
         }
     }
 
