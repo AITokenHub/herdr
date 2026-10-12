@@ -765,9 +765,15 @@ async fn run_client_loop(
                 }
             }
         }
+        let now = std::time::Instant::now();
+        if let Some(shell) = state.shell.as_mut() {
+            for endpoint_id in shell.take_machine_retries() {
+                supervisors.retry_now(&endpoint_id, now);
+            }
+        }
         if let Some(shell) = state.shell.as_ref() {
             supervisors.spawn_due(
-                std::time::Instant::now(),
+                now,
                 endpoint::EndpointConnectOptions {
                     cols: state.reported_size.0,
                     rows: state.reported_size.1,
@@ -1334,6 +1340,7 @@ async fn run_client_loop(
                     let unavailable = state.shell.as_mut().and_then(|shell| {
                         shell.set_endpoint_status(&endpoint_id, status);
                         shell.set_machine_diagnostic(&endpoint_id, message.clone());
+                        shell.report_machine_retry(&endpoint_id);
                         (status == endpoint::ClientEndpointStatus::Attention
                             && shell.endpoint_is_active(&endpoint_id))
                         .then(|| format!("{}: {message}", shell.endpoint_label(&endpoint_id)))

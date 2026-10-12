@@ -242,6 +242,20 @@ impl EndpointSupervisors {
         true
     }
 
+    /// A user asked for this machine now, so skip its pending backoff and restart the ladder.
+    /// Returns false when no attempt is waiting: it is online, in flight, or not retried at all.
+    pub(crate) fn retry_now(&mut self, endpoint_id: &ClientEndpointId, now: Instant) -> bool {
+        let Some(state) = self.endpoints.get_mut(endpoint_id) else {
+            return false;
+        };
+        if state.in_flight || state.next_attempt.is_none() {
+            return false;
+        }
+        state.attempts = 0;
+        state.next_attempt = Some(now);
+        true
+    }
+
     pub(crate) fn disconnected(
         &mut self,
         endpoint_id: &ClientEndpointId,
@@ -482,6 +496,55 @@ mod tests {
             supervisors.endpoints[&id].next_attempt,
             Some(failed + INITIAL_RETRY_DELAY)
         );
+    }
+
+    #[test]
+    fn requested_retry_skips_backoff_without_duplicating_attempts() {
+        let now = Instant::now();
+        let profile = profile();
+        let id = ClientEndpointId::Ssh(profile.id.clone());
+        let mut supervisors = EndpointSupervisors::new(&[profile], now);
+        let state = supervisors.endpoints.get_mut(&id).unwrap();
+        state.generation = Some(2);
+        state.attempts = 9;
+        assert!(supervisors.disconnected(&id, 2, now));
+        assert_eq!(
+            supervisors.endpoints[&id].next_attempt,
+            Some(now + MAX_RETRY_DELAY)
+        );
+
+        let clicked = now + Duration::from_secs(5);
+        assert!(supervisors.retry_now(&id, clicked));
+        assert_eq!(supervisors.endpoints[&id].next_attempt, Some(clicked));
+        // A failed requested attempt resumes from the shortest delay.
+        assert!(supervisors.disconnected(&id, 2, clicked));
+        assert_eq!(
+            supervisors.endpoints[&id].next_attempt,
+            Some(clicked + INITIAL_RETRY_DELAY)
+        );
+
+        supervisors.endpoints.get_mut(&id).unwrap().in_flight = true;
+        assert!(!supervisors.retry_now(&id, clicked));
+        assert!(supervisors.record_status(&id, 2, ClientEndpointStatus::Online, clicked));
+        assert!(!supervisors.retry_now(&id, clicked));
+        assert!(supervisors.endpoints[&id].next_attempt.is_none());
+    }
+
+    #[test]
+    fn requested_retry_does_not_revive_local_needing_attention() {
+        let now = Instant::now();
+        let mut supervisors = EndpointSupervisors::new(&[], now);
+        supervisors.add_local(PathBuf::from("local.sock"), Some(1), now);
+        assert!(supervisors.record_status(
+            &ClientEndpointId::Local,
+            1,
+            ClientEndpointStatus::Attention,
+            now
+        ));
+        assert!(!supervisors.retry_now(&ClientEndpointId::Local, now));
+        assert!(supervisors.endpoints[&ClientEndpointId::Local]
+            .next_attempt
+            .is_none());
     }
 
     #[test]
