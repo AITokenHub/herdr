@@ -296,6 +296,7 @@ fn run_client_with_mode(
                 loop_config.mouse_capture_active,
                 true,
                 !is_remote_client_process(),
+                &AtomicBool::new(false),
             )
             .map_err(|error| io::Error::other(error.to_string()))?;
             if federated

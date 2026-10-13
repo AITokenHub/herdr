@@ -1,6 +1,11 @@
 //! Remote thin-client launcher over SSH command stdio.
 
-use super::{args::*, process::wait_with_output_timeout, restart_policy::*, shell_quote};
+use super::{
+    args::*,
+    process::{wait_with_output_timeout, CancellablePipe, OwnedSshChild, PipeControl},
+    restart_policy::*,
+    shell_quote,
+};
 use base64::Engine as _;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -9,7 +14,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 
 use interprocess::local_socket::traits::Listener as _;
-#[cfg(all(test, unix))]
 use interprocess::local_socket::traits::Stream as _;
 use interprocess::local_socket::ListenerNonblockingMode;
 use interprocess::TryClone as _;
@@ -81,6 +85,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         session_name.clone(),
         remote_ssh.options(),
         false,
+        Arc::new(AtomicBool::new(false)),
     )?;
 
     run_client_process(
@@ -776,6 +781,7 @@ pub(super) struct RemoteSsh {
     session_name: String,
     managed_config: Option<ManagedSshConfig>,
     noninteractive: bool,
+    pub(super) cancelled: Arc<AtomicBool>,
 }
 
 impl RemoteSsh {
@@ -795,6 +801,7 @@ impl RemoteSsh {
             session_name,
             managed_config,
             noninteractive: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -843,8 +850,11 @@ impl RemoteSsh {
     }
 
     fn sh_output(&self, script: &str) -> io::Result<Output> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(super::process::cancelled());
+        }
         let script = posix_remote_output_command(script);
-        let mut child = self
+        let child = self
             .command()
             .arg("/bin/sh -s")
             .stdin(Stdio::piped())
@@ -859,20 +869,19 @@ impl RemoteSsh {
             )?);
         }
 
-        let write_result = if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(script.as_bytes())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "ssh bootstrap stdin missing",
-            ))
-        };
-        let output = wait_with_output_timeout(child, NONINTERACTIVE_SSH_COMMAND_TIMEOUT)?;
-        write_result?;
+        let output = wait_with_output_timeout(
+            child,
+            Some(script.into_bytes()),
+            NONINTERACTIVE_SSH_COMMAND_TIMEOUT,
+            Arc::clone(&self.cancelled),
+        )?;
         normalize_remote_output(output)
     }
 
     fn framed_user_shell_output(&self, remote_command: &str) -> io::Result<Output> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(super::process::cancelled());
+        }
         let mut command = self.command();
         command
             // Windows OpenSSH can still read the console with stdin redirected to NUL.
@@ -882,7 +891,12 @@ impl RemoteSsh {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let output = if self.noninteractive {
-            wait_with_output_timeout(command.spawn()?, NONINTERACTIVE_SSH_COMMAND_TIMEOUT)
+            wait_with_output_timeout(
+                command.spawn()?,
+                None,
+                NONINTERACTIVE_SSH_COMMAND_TIMEOUT,
+                Arc::clone(&self.cancelled),
+            )
         } else {
             output_with_forwarded_stderr(command.spawn()?, None)
         }?;
@@ -2159,6 +2173,7 @@ fn probe_remote_endpoint(
         ssh.session_name.clone(),
         ssh.options(),
         true,
+        Arc::clone(&ssh.cancelled),
     )?;
     let mut stream = crate::ipc::connect_local_stream(&path)?;
     // Use the saved client's noninteractive path. This metadata-only attachment never
@@ -2772,6 +2787,7 @@ impl SshStdioBridge {
         session_name: String,
         ssh_options: Option<&ManagedSshOptions>,
         noninteractive: bool,
+        should_stop: Arc<AtomicBool>,
     ) -> io::Result<Self> {
         Self::start_command(
             target,
@@ -2785,6 +2801,7 @@ impl SshStdioBridge {
             local_socket,
             ssh_options,
             noninteractive,
+            should_stop,
         )
     }
 
@@ -2794,6 +2811,7 @@ impl SshStdioBridge {
         local_socket: PathBuf,
         ssh_options: Option<&ManagedSshOptions>,
         noninteractive: bool,
+        should_stop: Arc<AtomicBool>,
     ) -> io::Result<Self> {
         crate::ipc::prepare_socket_path(&local_socket, |path| {
             format!("remote bridge is already listening at {}", path.display())
@@ -2811,7 +2829,6 @@ impl SshStdioBridge {
             return Err(err);
         }
 
-        let should_stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&should_stop);
         let thread_ssh_options = ssh_options.cloned();
         let (failure_tx, failure_rx) = mpsc::sync_channel(1);
@@ -3035,14 +3052,13 @@ pub(crate) fn bridge_upload_cancellation_for_test(
 }
 
 fn bridge_connection(
-    mut stream: crate::ipc::LocalStream,
+    stream: crate::ipc::LocalStream,
     target: &str,
     remote_command: &str,
     ssh_options: Option<&ManagedSshOptions>,
     noninteractive: bool,
     bridge_stop: &Arc<AtomicBool>,
 ) -> io::Result<()> {
-    let upload_stop = Arc::new(BridgeUploadStop::new()?);
     let mut command = Command::new("ssh");
     apply_managed_ssh_options(&mut command, ssh_options);
     if noninteractive {
@@ -3060,38 +3076,47 @@ fn bridge_connection(
             Stdio::inherit()
         });
 
-    let mut child = command
-        .spawn()
-        .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh bridge: {err}")))?;
-    let mut child_stdin = match child.stdin.take() {
-        Some(stdin) => stdin,
-        None => return terminate_bridge_child(child, "ssh bridge stdin missing"),
-    };
-    let child_stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => return terminate_bridge_child(child, "ssh bridge stdout missing"),
-    };
-    let stderr_reader = if noninteractive {
-        let Some(child_stderr) = child.stderr.take() else {
-            return terminate_bridge_child(child, "ssh bridge stderr missing");
-        };
-        Some(thread::spawn(move || capture_ssh_stderr(child_stderr)))
-    } else {
-        None
-    };
-    let stream_to_child = match stream.try_clone() {
-        Ok(stream) => stream,
-        Err(err) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(err);
-        }
-    };
-    if let Err(err) = crate::ipc::set_local_stream_polling(&mut stream, true) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(err);
-    }
+    bridge_child(stream, command, bridge_stop)
+}
+
+fn bridge_child(
+    stream: crate::ipc::LocalStream,
+    mut command: Command,
+    bridge_stop: &Arc<AtomicBool>,
+) -> io::Result<()> {
+    let upload_stop = Arc::new(BridgeUploadStop::new()?);
+
+    let mut child =
+        OwnedSshChild(command.spawn().map_err(|err| {
+            io::Error::new(err.kind(), format!("failed to start ssh bridge: {err}"))
+        })?);
+    let pipe_control = PipeControl::new(Arc::clone(bridge_stop));
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("ssh bridge stdin missing"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("ssh bridge stdout missing"))?;
+    let mut child_stdin = CancellablePipe::new(
+        crate::platform::ChildPipe::new_writer(stdin)?,
+        &pipe_control,
+    );
+    let child_stdout = CancellablePipe::new(
+        crate::platform::ChildPipe::new_reader(stdout)?,
+        &pipe_control,
+    );
+    let stderr = child
+        .stderr
+        .take()
+        .map(crate::platform::ChildPipe::new_reader)
+        .transpose()?
+        .map(|pipe| CancellablePipe::new(pipe, &pipe_control));
+    let stream_to_child = stream.try_clone()?;
+    // Both directions poll their own reads; writes must also remain cancellable on Windows.
+    stream.set_nonblocking(true)?;
+    let stderr_reader = stderr.map(|stderr| thread::spawn(move || capture_ssh_stderr(stderr)));
     let mut child_to_stream = stream;
 
     let connection_stop = Arc::new(AtomicBool::new(false));
@@ -3137,6 +3162,7 @@ fn bridge_connection(
         match child.try_wait() {
             Ok(Some(status)) => {
                 upload_stop.cancel();
+                pipe_control.finish_reads();
                 break (Ok(status), true);
             }
             Ok(None) => {}
@@ -3171,6 +3197,7 @@ fn bridge_connection(
     upload_stop.cancel();
     if !child_exited {
         connection_stop.store(true, Ordering::Release);
+        pipe_control.stop();
     }
     let upload_result = upload
         .join()
@@ -3272,12 +3299,6 @@ fn discard_remote_output_preamble(reader: &mut impl io::BufRead) -> io::Result<(
             return Ok(());
         }
     }
-}
-
-fn terminate_bridge_child(mut child: std::process::Child, message: &'static str) -> io::Result<()> {
-    let _ = child.kill();
-    let _ = child.wait();
-    Err(io::Error::new(io::ErrorKind::BrokenPipe, message))
 }
 
 fn copy_reader_to_local_stream<R: io::Read>(
@@ -3455,6 +3476,79 @@ fn sanitize_path_component(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bridge_cancellation_releases_stalled_preamble_upload_and_download() {
+        for mode in ["bridge-preamble", "bridge-input", "bridge-output"] {
+            let socket = local_forward_socket_path(mode, "cancellation-test");
+            let listener = crate::ipc::bind_private_local_listener(&socket).unwrap();
+            let mut client = crate::ipc::connect_local_stream(&socket).unwrap();
+            let server = listener.accept().unwrap();
+            drop(listener);
+            fs::remove_file(socket).unwrap();
+            client.set_nonblocking(true).unwrap();
+            let fixture = super::super::process::tests::PipeFixture::new(mode);
+            let mut command = fixture.command();
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&stop);
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                done_tx
+                    .send(bridge_child(server, command, &worker_stop))
+                    .unwrap();
+            });
+            let descendant = fixture.ready();
+            // Fill upload buffers while the fixture deliberately never reads stdin.
+            let deadline = Instant::now() + Duration::from_millis(150);
+            while Instant::now() < deadline {
+                if mode == "bridge-input" {
+                    let _ = client.write(&[b'x'; 16 * 1024]);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            stop.store(true, Ordering::Release);
+            let result = done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("bridge worker completes");
+            worker.join().unwrap();
+            assert!(result.is_ok(), "{mode}: {result:?}");
+            assert!(
+                crate::platform::process_exists(descendant),
+                "{mode}: cleanup waited for or killed the independent holder"
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_drains_final_output_while_descendant_retains_pipes() {
+        let socket = local_forward_socket_path("final-output", "cancellation-test");
+        let listener = crate::ipc::bind_private_local_listener(&socket).unwrap();
+        let mut client = crate::ipc::connect_local_stream(&socket).unwrap();
+        let server = listener.accept().unwrap();
+        drop(listener);
+        fs::remove_file(socket).unwrap();
+        let fixture = super::super::process::tests::PipeFixture::new("bridge-final");
+        let mut command = fixture.command();
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let worker =
+            thread::spawn(move || bridge_child(server, command, &Arc::new(AtomicBool::new(false))));
+        let descendant = fixture.ready();
+        let mut output = Vec::new();
+        client.read_to_end(&mut output).unwrap();
+        worker.join().unwrap().unwrap();
+        assert!(
+            crate::platform::process_exists(descendant),
+            "cleanup waited for or killed the independent holder"
+        );
+        assert!(String::from_utf8_lossy(&output).contains("final child output"));
+    }
 
     #[test]
     fn remote_client_preferences_cross_process_handoff() {
@@ -3675,6 +3769,7 @@ mod tests {
             "default".to_string(),
             None,
             false,
+            Arc::new(AtomicBool::new(false)),
         )
         .expect("start bridge listener");
 
@@ -3796,6 +3891,7 @@ mod tests {
             "default".to_string(),
             None,
             false,
+            Arc::new(AtomicBool::new(false)),
         )
         .expect("start bridge listener");
         let started = Instant::now();
@@ -3990,6 +4086,7 @@ mod tests {
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: Some(managed_config),
             noninteractive: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
         };
 
         let command = ssh.command();
@@ -4061,6 +4158,7 @@ mod tests {
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: Some(managed_config),
             noninteractive: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
         };
         let args = ssh
             .command()
@@ -4140,6 +4238,7 @@ mod tests {
             session_name: "probe-options".into(),
             managed_config: Some(managed_config),
             noninteractive: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
         };
         let remote = RemoteHerdr::for_platform(RemotePlatform {
             os: "linux",
@@ -4271,6 +4370,7 @@ mod tests {
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: None,
             noninteractive: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
         };
 
         let command = ssh.command();

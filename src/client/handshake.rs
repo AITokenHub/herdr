@@ -103,14 +103,14 @@ fn direct_graphics_profile_allowed() -> bool {
 fn read_handshake_response(
     stream: &mut LocalStream,
     read_timeout: Duration,
+    stopped: &AtomicBool,
 ) -> Result<ServerMessage, ClientError> {
     let deadline = Instant::now() + read_timeout;
     crate::ipc::set_local_stream_polling(stream, true).map_err(ClientError::ConnectionFailed)?;
-    let stopped = AtomicBool::new(false);
     let response = protocol::read_message(
         &mut super::transport::EndpointReader {
             stream,
-            stopped: &stopped,
+            stopped,
             deadline: Some(deadline),
         },
         MAX_FRAME_SIZE,
@@ -146,6 +146,7 @@ pub(crate) fn probe_endpoint_negotiation(
         false,
         false,
         false, // This probe uses an SSH bridge, not a shared filesystem.
+        &AtomicBool::new(false),
     )
     .map_err(io::Error::other)?;
     Ok(super::endpoint::EndpointNegotiation::new(
@@ -165,6 +166,9 @@ pub(super) struct HandshakePixelCapabilities {
 /// shells use the stable endpoint generation and negotiate whole codecs without
 /// comparing Herdr build versions. `local_transport` means the endpoint shares the
 /// client's filesystem, not merely that its bridge exposes a local socket.
+// Cancellation extends the existing handshake call; regrouping unrelated display options
+// would broaden this lifecycle fix across all client entry points.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn do_handshake(
     stream: &mut LocalStream,
     cols: u16,
@@ -177,6 +181,7 @@ pub(super) fn do_handshake(
     mouse_capture: bool,
     surface_active: bool,
     local_transport: bool,
+    stopped: &AtomicBool,
 ) -> Result<HandshakeResult, ClientError> {
     stream
         .set_nonblocking(false)
@@ -231,7 +236,7 @@ pub(super) fn do_handshake(
     } else {
         handshake_read_timeout()
     };
-    let welcome = read_handshake_response(stream, read_timeout)?;
+    let welcome = read_handshake_response(stream, read_timeout, stopped)?;
 
     if endpoint_shell {
         let ServerMessage::EndpointControl { kind, data } = welcome else {
@@ -356,7 +361,11 @@ mod tests {
                 }
             });
             let start = Instant::now();
-            let result = read_handshake_response(&mut client, Duration::from_millis(100));
+            let result = read_handshake_response(
+                &mut client,
+                Duration::from_millis(100),
+                &AtomicBool::new(false),
+            );
             let elapsed = start.elapsed();
             let _ = release.send(());
             peer.join().unwrap();
@@ -430,6 +439,7 @@ mod tests {
                     false,
                     true,
                     true,
+                    &AtomicBool::new(false),
                 );
                 peer.join().unwrap();
                 match outcome {

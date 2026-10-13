@@ -53,6 +53,8 @@ struct ReconnectState {
     attempts: u32,
     next_attempt: Option<Instant>,
     in_flight: bool,
+    cancelled: Arc<AtomicBool>,
+    completed: Arc<AtomicBool>,
     generation: Option<u64>,
     ready_since: Option<Instant>,
 }
@@ -64,14 +66,31 @@ impl ReconnectState {
             attempts: 0,
             next_attempt: Some(now),
             in_flight: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            completed: Arc::new(AtomicBool::new(true)),
             generation: None,
             ready_since: None,
         }
     }
 }
 
+impl Drop for ReconnectState {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+struct AttemptCompletion(Arc<AtomicBool>);
+
+impl Drop for AttemptCompletion {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 pub(crate) struct EndpointSupervisors {
     endpoints: HashMap<ClientEndpointId, ReconnectState>,
+    retired: HashMap<ClientEndpointId, Arc<AtomicBool>>,
     next_generation: u64,
     shutdown: Arc<AtomicBool>,
 }
@@ -90,6 +109,7 @@ impl EndpointSupervisors {
             .collect();
         Self {
             endpoints,
+            retired: HashMap::new(),
             next_generation: 2,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
@@ -101,7 +121,13 @@ impl EndpointSupervisors {
         if generation.is_some() {
             state.next_attempt = None;
         }
-        self.endpoints.insert(ClientEndpointId::Local, state);
+        if let Some(previous) = self.endpoints.insert(ClientEndpointId::Local, state) {
+            if !previous.completed.load(Ordering::Acquire) {
+                self.retired
+                    .entry(ClientEndpointId::Local)
+                    .or_insert_with(|| Arc::clone(&previous.completed));
+            }
+        }
     }
 
     pub(crate) fn reconcile_profiles(
@@ -110,6 +136,7 @@ impl EndpointSupervisors {
         now: Instant,
     ) -> Vec<ClientEndpointId> {
         let mut retired = Vec::new();
+        let retiring = &mut self.retired;
         self.endpoints.retain(|endpoint_id, state| {
             let ConnectTarget::Ssh(previous) = &state.target else {
                 return true;
@@ -122,6 +149,12 @@ impl EndpointSupervisors {
             });
             if !keep {
                 retired.push(endpoint_id.clone());
+                // A stale Connected event still owns its bridge until the client rejects it.
+                if !state.completed.load(Ordering::Acquire) {
+                    retiring
+                        .entry(endpoint_id.clone())
+                        .or_insert_with(|| Arc::clone(&state.completed));
+                }
             }
             keep
         });
@@ -141,11 +174,21 @@ impl EndpointSupervisors {
         options: EndpointConnectOptions,
         event_tx: &tokio::sync::mpsc::Sender<EndpointSupervisorEvent>,
     ) {
+        self.retired
+            .retain(|_, completed| !completed.load(Ordering::Acquire));
         for (endpoint_id, state) in &mut self.endpoints {
-            if state.in_flight || state.next_attempt.is_none_or(|deadline| deadline > now) {
+            if state.in_flight
+                || !state.completed.load(Ordering::Acquire)
+                || self.retired.contains_key(endpoint_id)
+                || state.next_attempt.is_none_or(|deadline| deadline > now)
+            {
                 continue;
             }
             state.in_flight = true;
+            state.cancelled = Arc::new(AtomicBool::new(false));
+            let cancelled = Arc::clone(&state.cancelled);
+            state.completed = Arc::new(AtomicBool::new(false));
+            let completed = Arc::clone(&state.completed);
             state.next_attempt = None;
             let generation = self.next_generation;
             state.generation = Some(generation);
@@ -156,11 +199,19 @@ impl EndpointSupervisors {
             let shutdown = self.shutdown.clone();
             tokio::spawn(async move {
                 if shutdown.load(Ordering::Acquire) {
+                    completed.store(true, Ordering::Release);
                     return;
                 }
                 let task_endpoint_id = endpoint_id.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    connect_once(&target, options, endpoint_id, generation)
+                    connect_once(
+                        &target,
+                        options,
+                        endpoint_id,
+                        generation,
+                        cancelled,
+                        completed,
+                    )
                 })
                 .await;
                 let event = match result {
@@ -296,10 +347,24 @@ fn connect_once(
     options: EndpointConnectOptions,
     endpoint_id: ClientEndpointId,
     generation: u64,
+    cancelled: Arc<AtomicBool>,
+    completed: Arc<AtomicBool>,
 ) -> Result<EndpointSupervisorEvent, std::io::Error> {
+    let completion = AttemptCompletion(completed);
+    if cancelled.load(Ordering::Acquire) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "connection attempt cancelled",
+        ));
+    }
     let (mut stream, lifetime): (_, Box<dyn Send>) = match target {
         ConnectTarget::Local(path) => {
-            let stream = crate::ipc::connect_local_stream(path).map_err(|error| {
+            let stream = crate::ipc::connect_local_stream_cancellable(
+                path,
+                &cancelled,
+                Instant::now() + super::super::handshake::LOCAL_HANDSHAKE_READ_TIMEOUT,
+            )
+            .map_err(|error| {
                 // An absent Local socket is transient, unlike a missing SSH install.
                 if error.kind() == std::io::ErrorKind::NotFound {
                     std::io::Error::new(
@@ -317,6 +382,8 @@ fn connect_once(
                 profile.id.as_str(),
                 &profile.target,
                 &profile.session,
+                generation,
+                Arc::clone(&cancelled),
             )?;
             (connected.stream, Box::new(connected.bridge))
         }
@@ -336,8 +403,15 @@ fn connect_once(
         options.mouse_capture,
         false,
         matches!(target, ConnectTarget::Local(_)),
+        &cancelled,
     )
     .map_err(handshake_error)?;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "connection attempt cancelled",
+        ));
+    }
     if handshake.encoding != RenderEncoding::SemanticFrame {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -357,7 +431,8 @@ fn connect_once(
         ));
     }
     let reader = stream.try_clone()?;
-    let writer = NativeEndpointTransport::with_lifetime(stream, lifetime)?;
+    // The completion barrier follows the bridge through queued and active transports.
+    let writer = NativeEndpointTransport::with_lifetime(stream, (lifetime, completion))?;
     Ok(EndpointSupervisorEvent::Connected {
         endpoint_id,
         generation,
@@ -403,6 +478,157 @@ fn retry_delay(attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn connect_options() -> EndpointConnectOptions {
+        EndpointConnectOptions {
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            pixel_geometry_exact: false,
+            pixel_mouse: false,
+            surface_size: ClientSurfaceSize { cols: 80, rows: 24 },
+            endpoint_keybindings: false,
+            mouse_capture: false,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replacement_waits_for_queued_connection_teardown() {
+        use crate::protocol::endpoint::{EndpointServerWelcome, ENDPOINT_WELCOME_KIND};
+        use crate::protocol::{self, ClientMessage, ServerMessage};
+        use interprocess::local_socket::traits::{Listener as _, Stream as _};
+        let path = std::env::temp_dir().join(format!("hretired-{}.sock", std::process::id()));
+        let listener = crate::ipc::bind_private_local_listener(&path).unwrap();
+        let now = Instant::now();
+        let mut supervisors = EndpointSupervisors::new(&[], now);
+        supervisors.add_local(path.clone(), None, now);
+        let (events, mut received) = tokio::sync::mpsc::channel(4);
+        supervisors.spawn_due(now, connect_options(), &events);
+        let mut peer = listener.accept().unwrap();
+        let _: ClientMessage = protocol::read_message(&mut peer, protocol::MAX_FRAME_SIZE).unwrap();
+        protocol::write_message(
+            &mut peer,
+            &ServerMessage::EndpointControl {
+                kind: ENDPOINT_WELCOME_KIND.into(),
+                data: serde_json::to_string(&EndpointServerWelcome::compatible(vec![
+                    "client_shell.surface.set".into(),
+                ]))
+                .unwrap(),
+            },
+        )
+        .unwrap();
+        let queued = tokio::time::timeout(Duration::from_secs(2), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let EndpointSupervisorEvent::Connected { generation, .. } = &queued else {
+            panic!("handshake failed");
+        };
+        let old_generation = *generation;
+        // Repeated catalog replacements must keep the original unfinished barrier.
+        for _ in 0..3 {
+            supervisors.add_local(path.clone(), None, now);
+            supervisors.spawn_due(now, connect_options(), &events);
+            assert!(supervisors.endpoints[&ClientEndpointId::Local]
+                .generation
+                .is_none());
+            assert_eq!(supervisors.retired.len(), 1);
+        }
+        assert!(!supervisors.record_status(
+            &ClientEndpointId::Local,
+            old_generation,
+            ClientEndpointStatus::Online,
+            now
+        ));
+        peer.set_nonblocking(true).unwrap();
+        assert!(matches!(
+            crate::ipc::poll_local_stream_read_count(&mut peer, &mut [0; 1]).unwrap(),
+            crate::ipc::LocalStreamReadCount::Pending
+        ));
+        drop(queued);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            supervisors.spawn_due(now, connect_options(), &events);
+            if supervisors.endpoints[&ClientEndpointId::Local]
+                .generation
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "retired transport did not release its attempt"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(supervisors.retired.is_empty());
+        assert!(matches!(
+            crate::ipc::poll_local_stream_read_count(&mut peer, &mut [0; 1]).unwrap(),
+            crate::ipc::LocalStreamReadCount::Closed
+        ));
+        let _replacement = listener.accept().unwrap();
+        drop(supervisors);
+        drop(listener);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retiring_or_shutting_down_a_silent_attempt_closes_its_connection() {
+        use crate::protocol::{self, ClientMessage};
+        use interprocess::local_socket::traits::{Listener as _, Stream as _};
+        for shutdown in [false, true] {
+            let path = std::env::temp_dir()
+                .join(format!("hcancel-{}-{shutdown}.sock", std::process::id()));
+            let listener = crate::ipc::bind_private_local_listener(&path).unwrap();
+            let now = Instant::now();
+            let mut supervisors = EndpointSupervisors::new(&[], now);
+            supervisors.add_local(path.clone(), None, now);
+            let (events, mut received) = tokio::sync::mpsc::channel(4);
+            supervisors.spawn_due(now, connect_options(), &events);
+            let mut peer = listener.accept().unwrap();
+            let _: ClientMessage =
+                protocol::read_message(&mut peer, protocol::MAX_FRAME_SIZE).unwrap();
+            drop(listener);
+            std::fs::remove_file(path).unwrap();
+            let started = Instant::now();
+            if shutdown {
+                drop(supervisors);
+            } else {
+                supervisors.add_local(PathBuf::from("replacement"), None, now);
+                let event = tokio::time::timeout(Duration::from_secs(2), received.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let EndpointSupervisorEvent::Status {
+                    endpoint_id,
+                    generation,
+                    status,
+                    ..
+                } = event
+                else {
+                    panic!("cancelled attempt connected");
+                };
+                assert!(!supervisors.record_status(&endpoint_id, generation, status, now));
+            }
+            peer.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if matches!(
+                    crate::ipc::poll_local_stream_read_count(&mut peer, &mut [0; 1]).unwrap(),
+                    crate::ipc::LocalStreamReadCount::Closed
+                ) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "cancelled attempt retained its stream"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+    }
     use crate::client::endpoint::ProfileId;
 
     fn profile() -> super::super::SavedSshEndpoint {
