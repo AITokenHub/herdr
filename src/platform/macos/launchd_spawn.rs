@@ -431,6 +431,12 @@ mod tests {
             return;
         };
         let warning = leave_launchd_job();
+        // The launcher exits right after forking; wait until that is visible.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        // SAFETY: plain process query.
+        while unsafe { libc::getppid() } != 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         // SAFETY: plain process queries.
         let (pid, ppid, sid) = unsafe { (libc::getpid(), libc::getppid(), libc::getsid(0)) };
         let line = format!(
