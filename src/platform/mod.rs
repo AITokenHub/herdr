@@ -292,7 +292,7 @@ pub fn launch_server_daemon_command(command: &mut std::process::Command) -> std:
 #[cfg(target_os = "macos")]
 pub fn launch_server_daemon_command(command: &mut std::process::Command) -> std::io::Result<u32> {
     match macos::spawn_launchd_job(command) {
-        Ok(()) => Ok(0),
+        Ok(_label) => Ok(0),
         Err(err) => {
             tracing::info!(%err, "starting the server directly instead of through launchd");
             command.spawn().map(|child| child.id())

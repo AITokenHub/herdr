@@ -27,8 +27,8 @@ const STALE_JOB_AGE: Duration = Duration::from_secs(60);
 /// Submits `command` (program, arguments, environment changes, working
 /// directory) as a run-once job in the caller's GUI launchd domain. Fails, so
 /// the caller can spawn directly, when there is no GUI domain or the command
-/// cannot be represented exactly in a launchd job.
-pub(crate) fn spawn_launchd_job(command: &Command) -> io::Result<()> {
+/// cannot be represented exactly in a launchd job. Returns the job label.
+pub(crate) fn spawn_launchd_job(command: &Command) -> io::Result<String> {
     if std::env::var_os("SSH_CONNECTION").is_some() {
         // SSH logins already run outside any terminal app; keep them out of
         // the desktop session too.
@@ -51,16 +51,15 @@ pub(crate) fn spawn_launchd_job(command: &Command) -> io::Result<()> {
     let dir = PrivateDir::create()?;
     let plist_path = dir.path().join("job.plist");
     write_private_file(&plist_path, plist.as_bytes())?;
-    launchctl(&["bootstrap", &domain, &plist_path.to_string_lossy()]).map(|_| ())
+    launchctl(&["bootstrap", &domain, &plist_path.to_string_lossy()])?;
+    Ok(label)
 }
 
 /// Called first thing in the server process. Inside the launchd job, forks
 /// the real server into its own session and lets the job process exit.
 /// Returns a warning to log once logging is up if the server stays in the job.
 pub(crate) fn leave_launchd_job() -> Option<String> {
-    if std::env::var_os(DETACH_ENV).is_none() {
-        return None;
-    }
+    std::env::var_os(DETACH_ENV)?;
     std::env::remove_var(DETACH_ENV);
     // launchd names the job here; panes should see what a terminal shell sees.
     std::env::set_var("XPC_SERVICE_NAME", "0");
@@ -422,17 +421,107 @@ mod tests {
         assert_eq!(coalition, resource_coalition(std::process::id()));
     }
 
+    const DETACH_HELPER_OUT: &str = "HERDR_LAUNCHD_DETACH_HELPER_OUT";
+
+    /// Body of the launchd job in `detached_server_outlives_its_launcher_job`.
+    #[test]
+    #[ignore = "runs only as the launchd job of another test"]
+    fn detach_helper() {
+        let Some(out) = std::env::var_os(DETACH_HELPER_OUT) else {
+            return;
+        };
+        let warning = leave_launchd_job();
+        // SAFETY: plain process queries.
+        let (pid, ppid, sid) = unsafe { (libc::getpid(), libc::getppid(), libc::getsid(0)) };
+        let line = format!(
+            "{pid} {ppid} {sid} {} {} {}",
+            std::env::var("XPC_SERVICE_NAME").unwrap_or_default(),
+            std::env::var_os(DETACH_ENV).is_some(),
+            warning.is_some(),
+        );
+        let _ = std::fs::write(out, line);
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    fn gui_domain_available() -> Option<libc::uid_t> {
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        (launchctl(&["print", &format!("gui/{uid}")]).is_ok()
+            && std::env::var_os("SSH_CONNECTION").is_none())
+        .then_some(uid)
+    }
+
+    fn wait_for_output(out: &Path) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::fs::metadata(out).map_or(true, |meta| meta.len() == 0)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::read_to_string(out).expect("job output")
+    }
+
+    /// Needs a GUI login session; skipped only where the gui domain is absent.
+    #[test]
+    fn detached_server_outlives_its_launcher_job() {
+        let Some(uid) = gui_domain_available() else {
+            eprintln!("skipping: no gui launchd domain for this test process");
+            return;
+        };
+        let dir = PrivateDir::create().expect("dir");
+        let out = dir.path().join("out");
+        let mut command = Command::new(std::env::current_exe().expect("test binary"));
+        command
+            .args([
+                "--exact",
+                "platform::macos::launchd_spawn::tests::detach_helper",
+            ])
+            .args(["--ignored", "--test-threads=1"])
+            .env(DETACH_HELPER_OUT, &out);
+
+        let label = spawn_launchd_job(&command).expect("launchd job");
+        let written = wait_for_output(&out);
+        let target = format!("gui/{uid}/{label}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while job_is_running(&target) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let launcher_running = job_is_running(&target);
+        // Removing the finished job must not take the detached server with it.
+        let _ = launchctl(&["bootout", &target]);
+        std::thread::sleep(Duration::from_millis(300));
+
+        let fields: Vec<&str> = written.split(' ').collect();
+        let pid: libc::pid_t = fields[0].parse().expect("pid");
+        // SAFETY: probes and then stops the helper process started by this test.
+        let alive_after_bootout = unsafe { libc::kill(pid, 0) } == 0;
+        let detached_coalition = resource_coalition(pid as u32);
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+
+        assert!(!launcher_running, "the launcher job finished: {written}");
+        assert!(
+            alive_after_bootout,
+            "the detached server survives: {written}"
+        );
+        assert_eq!(fields[1], "1", "reparented to launchd: {written}");
+        assert_eq!(fields[2], fields[0], "leads its own session: {written}");
+        assert_eq!(fields[3], "0", "job name hidden from panes: {written}");
+        assert_eq!(fields[4], "false", "detach marker consumed: {written}");
+        assert_eq!(fields[5], "false", "no detach warning: {written}");
+        assert_ne!(
+            detached_coalition,
+            resource_coalition(std::process::id()),
+            "outside the caller's coalition"
+        );
+    }
+
     /// Needs a GUI login session; skipped only where the gui domain is absent.
     #[test]
     fn job_runs_outside_the_callers_coalition_and_is_not_restarted() {
-        // SAFETY: getuid has no preconditions.
-        let uid = unsafe { libc::getuid() };
-        if launchctl(&["print", &format!("gui/{uid}")]).is_err()
-            || std::env::var_os("SSH_CONNECTION").is_some()
-        {
+        let Some(uid) = gui_domain_available() else {
             eprintln!("skipping: no gui launchd domain for this test process");
             return;
-        }
+        };
         let dir = PrivateDir::create().expect("dir");
         let out = dir.path().join("out");
         let mut command = Command::new("/bin/sh");
@@ -442,29 +531,12 @@ mod tests {
             .env("HERDR_LAUNCHD_TEST", "yes")
             .current_dir(dir.path());
 
-        spawn_launchd_job(&command).expect("launchd job");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::fs::metadata(&out).map_or(true, |meta| meta.len() == 0)
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let written = std::fs::read_to_string(&out).expect("job output");
+        let label = spawn_launchd_job(&command).expect("launchd job");
+        let written = wait_for_output(&out);
         let mut fields = written.split(' ');
         let pid: u32 = fields.next().and_then(|pid| pid.parse().ok()).expect("pid");
         let job_coalition = resource_coalition(pid);
         let own_coalition = resource_coalition(std::process::id());
-        let label = launchctl(&["list"])
-            .ok()
-            .and_then(|list| {
-                list.lines()
-                    .filter_map(|line| line.split('\t').nth(2))
-                    .find(|label| {
-                        label.starts_with(&format!("{LABEL_PREFIX}{}.", std::process::id()))
-                    })
-                    .map(str::to_owned)
-            })
-            .expect("job is loaded");
 
         // SAFETY: signals the job process started by this test.
         unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
