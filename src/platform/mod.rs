@@ -6,6 +6,59 @@
 #[cfg(unix)]
 pub(crate) mod ssh_agent;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Native adapters construct only the event classifications their OS can report.
+#[allow(dead_code)]
+pub(crate) enum HostPowerEvent {
+    Suspend,
+    AutomaticResume,
+    InteractiveResume,
+    UnclassifiedResume,
+}
+
+pub(crate) struct HostPowerMonitor {
+    events: tokio::sync::mpsc::UnboundedReceiver<HostPowerEvent>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl HostPowerMonitor {
+    pub(crate) fn start(enabled: bool) -> Self {
+        let (sender, events) = tokio::sync::mpsc::unbounded_channel();
+        let task = if enabled {
+            monitor_host_power(sender)
+        } else {
+            None
+        };
+        Self { events, task }
+    }
+
+    pub(crate) fn try_recv(&mut self) -> Option<HostPowerEvent> {
+        self.events.try_recv().ok()
+    }
+
+    pub(crate) async fn recv(&mut self) -> HostPowerEvent {
+        match self.events.recv().await {
+            Some(event) => event,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+impl Drop for HostPowerMonitor {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn monitor_host_power(
+    _sender: tokio::sync::mpsc::UnboundedSender<HostPowerEvent>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    None
+}
+
 pub(crate) struct HostShutdownMonitor {
     task: Option<tokio::task::JoinHandle<()>>,
 }

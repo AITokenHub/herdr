@@ -28,6 +28,8 @@ pub(crate) use bootstrap::{configure_server_daemon_context, prepare_server_proce
 
 mod shutdown;
 pub(crate) use shutdown::monitor_host_shutdown;
+mod power;
+pub(crate) use power::monitor_host_power;
 
 #[cfg(test)]
 mod config_file_tests;
