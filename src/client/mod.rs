@@ -738,6 +738,7 @@ async fn run_client_loop(
                                 present_handoff_unavailable(
                                     &mut state,
                                     "Local is unavailable; reconnecting".into(),
+                                    None,
                                 );
                             }
                         }
@@ -765,9 +766,15 @@ async fn run_client_loop(
                 }
             }
         }
+        let now = std::time::Instant::now();
+        if let Some(shell) = state.shell.as_mut() {
+            for endpoint_id in shell.take_machine_retries() {
+                supervisors.retry_now(&endpoint_id, now);
+            }
+        }
         if let Some(shell) = state.shell.as_ref() {
             supervisors.spawn_due(
-                std::time::Instant::now(),
+                now,
                 endpoint::EndpointConnectOptions {
                     cols: state.reported_size.0,
                     rows: state.reported_size.1,
@@ -1331,20 +1338,7 @@ async fn run_client_loop(
                     if status == endpoint::ClientEndpointStatus::Attention {
                         warn!(endpoint = %endpoint_id.storage_key(), generation, error = %message, "endpoint needs attention");
                     }
-                    let unavailable = state.shell.as_mut().and_then(|shell| {
-                        shell.set_endpoint_status(&endpoint_id, status);
-                        shell.set_machine_diagnostic(&endpoint_id, message.clone());
-                        (status == endpoint::ClientEndpointStatus::Attention
-                            && shell.endpoint_is_active(&endpoint_id))
-                        .then(|| format!("{}: {message}", shell.endpoint_label(&endpoint_id)))
-                    });
-                    if let Some(message) = unavailable {
-                        present_handoff_unavailable(&mut state, message);
-                    } else if let Some(frame) = state.shell.as_mut().and_then(|shell| {
-                        shell.compose(state.reported_size.0, state.reported_size.1)
-                    }) {
-                        state.present_frame(frame);
-                    }
+                    present_endpoint_connection_failure(&mut state, &endpoint_id, status, message);
                 }
                 endpoint::EndpointSupervisorEvent::Connected {
                     endpoint_id,
