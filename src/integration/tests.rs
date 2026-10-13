@@ -1110,7 +1110,7 @@ fn install_claude_removes_deprecated_completion_hooks_and_preserves_user_hooks()
 }
 
 #[test]
-fn claude_v9_integration_status_is_outdated_until_reinstalled() {
+fn claude_v11_integration_status_is_outdated_until_reinstalled() {
     let _lock = integration_env_lock();
     let base = unique_base();
     let home = base.join("home");
@@ -1119,7 +1119,7 @@ fn claude_v9_integration_status_is_outdated_until_reinstalled() {
     let hook_path = claude_hooks_dir.join(CLAUDE_HOOK_INSTALL_NAME);
     fs::write(
         &hook_path,
-        "#!/bin/sh\n# HERDR_INTEGRATION_ID=claude\n# HERDR_INTEGRATION_VERSION=9\n",
+        "#!/bin/sh\n# HERDR_INTEGRATION_ID=claude\n# HERDR_INTEGRATION_VERSION=11\n",
     )
     .unwrap();
     std::env::set_var("HOME", &home);
@@ -1131,8 +1131,8 @@ fn claude_v9_integration_status_is_outdated_until_reinstalled() {
         .unwrap();
 
     assert_eq!(claude.path, hook_path);
-    assert_eq!(claude.installed_version, Some(9));
-    assert_eq!(claude.expected_version, 11);
+    assert_eq!(claude.installed_version, Some(11));
+    assert_eq!(claude.expected_version, 12);
     assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
     install_claude().unwrap();
@@ -1141,7 +1141,7 @@ fn claude_v9_integration_status_is_outdated_until_reinstalled() {
         hook_path,
         CLAUDE_INTEGRATION_VERSION,
     );
-    assert_eq!(status.installed_version, Some(11));
+    assert_eq!(status.installed_version, Some(12));
     assert_eq!(status.state, IntegrationStatusKind::Current);
 
     std::env::remove_var("HOME");
@@ -1171,7 +1171,7 @@ fn claude_v2_integration_status_is_outdated() {
 
     assert_eq!(claude.path, hook_path);
     assert_eq!(claude.installed_version, Some(2));
-    assert_eq!(claude.expected_version, 11);
+    assert_eq!(claude.expected_version, 12);
     assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
     std::env::remove_var("HOME");

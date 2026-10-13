@@ -56,6 +56,18 @@ fn run_shell_hook_with_env(
     hook_input: &str,
     envs: &[(&str, &str)],
 ) -> Option<serde_json::Value> {
+    run_shell_hook_under_parent(asset_path, args, hook_input, envs, None)
+}
+
+/// Runs the hook as a child of a shell renamed to `parent_name`, standing in
+/// for the agent process that spawns hooks.
+fn run_shell_hook_under_parent(
+    asset_path: &str,
+    args: &[&str],
+    hook_input: &str,
+    envs: &[(&str, &str)],
+    parent_name: Option<&str>,
+) -> Option<serde_json::Value> {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
     let socket_path = base.join("herdr.sock");
@@ -85,9 +97,33 @@ fn run_shell_hook_with_env(
     });
 
     let hook_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(asset_path);
-    let mut command = Command::new("bash");
+    let mut command = match parent_name {
+        Some(parent_name) => {
+            let parent = base.join(parent_name);
+            let bash = String::from_utf8(
+                Command::new("sh")
+                    .args(["-c", "command -v bash"])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(bash.trim(), &parent).unwrap();
+            let mut command = Command::new(parent);
+            // The trailing `exit` keeps the parent alive instead of letting it
+            // exec the hook in place.
+            command
+                .args(["-c", r#"bash "$@"; exit $?"#, "parent"])
+                .arg(hook_path);
+            command
+        }
+        None => {
+            let mut command = Command::new("bash");
+            command.arg(hook_path);
+            command
+        }
+    };
     command
-        .arg(hook_path)
         .args(args)
         .env("HERDR_ENV", "1")
         .env("HERDR_SOCKET_PATH", &socket_path)
@@ -158,6 +194,37 @@ fn claude_hook_reports_session_id_from_stdin() {
     assert_eq!(request["method"], "pane.report_agent_session");
     assert_eq!(request["params"]["agent_session_id"], "claude-session");
     assert!(request["params"].get("state").is_none());
+    assert!(request["params"].get("resume_argv").is_none());
+}
+
+#[test]
+fn claude_hook_reports_qlaude_resume_command_under_qlaude() {
+    for parent_name in ["qlaude", "qlaude-2.1.296"] {
+        let request = run_shell_hook_under_parent(
+            "src/integration/assets/claude/herdr-agent-state.sh",
+            &["session"],
+            r#"{"hook_event_name":"SessionStart","session_id":"claude-session"}"#,
+            &[],
+            Some(parent_name),
+        )
+        .expect("session start should report session identity");
+
+        assert_eq!(request["params"]["agent"], "claude");
+        assert_eq!(
+            request["params"]["resume_argv"],
+            serde_json::json!(["qlaude", "--resume", "claude-session"])
+        );
+    }
+
+    let request = run_shell_hook_under_parent(
+        "src/integration/assets/claude/herdr-agent-state.sh",
+        &["session"],
+        r#"{"hook_event_name":"SessionStart","session_id":"claude-session"}"#,
+        &[],
+        Some("claude"),
+    )
+    .expect("session start should report session identity");
+    assert!(request["params"].get("resume_argv").is_none());
 }
 
 #[test]

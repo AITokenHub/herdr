@@ -3,7 +3,7 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=claude
-# HERDR_INTEGRATION_VERSION=11
+# HERDR_INTEGRATION_VERSION=12
 
 set -eu
 
@@ -26,7 +26,9 @@ HERDR_ACTION="$action" HERDR_HOOK_INPUT_FILE="$hook_input_file" python3 - <<'PY'
 import json
 import os
 import random
+import re
 import socket
+import subprocess
 import time
 
 source = "herdr:claude"
@@ -37,6 +39,36 @@ hook_input_file = os.environ.get("HERDR_HOOK_INPUT_FILE")
 
 if not pane_id or not socket_path:
     raise SystemExit(0)
+
+
+def resume_launcher():
+    # qlaude wraps Claude Code in a patched `qlaude-<version>` build that only
+    # its `qlaude` launcher can start, so resume must go through the launcher.
+    # The agent is at most three levels up: this script's shell, the agent's
+    # hook command shell, then the agent. Looking further would match a qlaude
+    # that merely hosts the shell running some other agent.
+    pid = os.getppid()
+    for _ in range(3):
+        if pid <= 1:
+            return None
+        try:
+            output = subprocess.run(
+                ["ps", "-o", "ppid=", "-o", "comm=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=1,
+            ).stdout.strip()
+            parent, name = output.split(None, 1)
+            pid = int(parent)
+        except Exception:
+            return None
+        name = os.path.basename(name.strip()).lower()
+        if name == "qlaude" or re.match(r"qlaude-[0-9]", name):
+            return "qlaude"
+        if name == "claude":
+            return None
+    return None
+
 
 hook_input = {}
 if hook_input_file:
@@ -77,6 +109,9 @@ if agent_session_id:
         params["agent_session_path"] = agent_session_path
     if session_start_source:
         params["session_start_source"] = session_start_source
+    launcher = resume_launcher()
+    if launcher:
+        params["resume_argv"] = [launcher, "--resume", agent_session_id]
     request = {
         "id": request_id,
         "method": "pane.report_agent_session",

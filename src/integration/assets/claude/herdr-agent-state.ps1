@@ -2,7 +2,7 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=claude
-# HERDR_INTEGRATION_VERSION=11
+# HERDR_INTEGRATION_VERSION=12
 
 param([string]$Action = "")
 
@@ -28,6 +28,31 @@ if (-not [string]::IsNullOrWhiteSpace($payload.agent_id)) { exit 0 }
 $sessionId = $payload.session_id
 if ([string]::IsNullOrWhiteSpace($sessionId)) { exit 0 }
 
+# qlaude wraps Claude Code in a patched `qlaude-<version>` build that only its
+# `qlaude` launcher can start, so resume must go through the launcher.
+# The agent is at most three levels up: the hook command shell may sit between
+# it and this script. Looking further would match a qlaude that merely hosts
+# the shell running some other agent.
+function Get-ResumeLauncher {
+    $processId = $PID
+    for ($i = 0; $i -le 3; $i++) {
+        try {
+            $process = Get-CimInstance Win32_Process -Filter "ProcessId=$processId" -ErrorAction Stop
+        } catch {
+            return $null
+        }
+        if ($null -eq $process) { return $null }
+        if ($processId -ne $PID) {
+            $name = ([string]$process.Name).ToLowerInvariant() -replace '\.exe$', ''
+            if ($name -eq "qlaude" -or $name -match '^qlaude-[0-9]') { return "qlaude" }
+            if ($name -eq "claude") { return $null }
+        }
+        $processId = $process.ParentProcessId
+        if ($processId -le 0) { return $null }
+    }
+    return $null
+}
+
 $seq = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 $herdr = if ([string]::IsNullOrWhiteSpace($env:HERDR_BIN_PATH)) { "herdr" } else { $env:HERDR_BIN_PATH }
 try {
@@ -49,6 +74,10 @@ try {
     }
     if ($payload.hook_event_name -eq "SessionStart" -and $payload.source -is [string] -and -not [string]::IsNullOrWhiteSpace($payload.source)) {
         $args += @("--session-start-source", "$($payload.source)")
+    }
+    $launcher = Get-ResumeLauncher
+    if ($launcher) {
+        $args += @("--", $launcher, "--resume", "$sessionId")
     }
     & $herdr @args 2>$null | Out-Null
 } catch {

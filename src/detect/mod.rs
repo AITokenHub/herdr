@@ -199,7 +199,7 @@ fn lookup_agent(name: &str) -> Option<Agent> {
     let name = path_basename(name);
     match name {
         "pi" => Some(Agent::Pi),
-        "claude" | "claude-code" => Some(Agent::Claude),
+        "claude" | "claude-code" | "qlaude" => Some(Agent::Claude),
         "codex" => Some(Agent::Codex),
         "gemini" => Some(Agent::Gemini),
         "cursor" | "cursor-agent" => Some(Agent::Cursor),
@@ -223,6 +223,7 @@ fn lookup_agent(name: &str) -> Option<Agent> {
         "maki" => Some(Agent::Maki),
         "muse" | "muse-code" | "muse-cli" => Some(Agent::Muse),
         _ if is_muse_versioned_binary(name) => Some(Agent::Muse),
+        _ if is_qlaude_versioned_binary(name) => Some(Agent::Claude),
         _ => None,
     }
 }
@@ -235,8 +236,19 @@ fn lookup_agent(name: &str) -> Option<Agent> {
 /// Accepts path-qualified `argv0` values by checking only the basename, since
 /// the launcher may `exec` with an absolute install-dir path.
 fn is_muse_versioned_binary(name: &str) -> bool {
+    has_versioned_suffix(name, "muse-bin-")
+}
+
+/// qlaude launches a patched Claude Code build named `qlaude-<version>`
+/// (e.g. `qlaude-2.1.296`) and keeps the `qlaude` launcher as the job leader.
+/// Both run the unmodified Claude Code screen, so they share its manifest.
+fn is_qlaude_versioned_binary(name: &str) -> bool {
+    has_versioned_suffix(name, "qlaude-")
+}
+
+fn has_versioned_suffix(name: &str, prefix: &str) -> bool {
     path_basename(name)
-        .strip_prefix("muse-bin-")
+        .strip_prefix(prefix)
         .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
 }
 
@@ -1019,6 +1031,16 @@ mod tests {
             identify_agent(r"C:\Users\user\muse-bin-0.2.1-R1215.1.exe"),
             Some(Agent::Muse)
         );
+        assert_eq!(identify_agent("qlaude"), Some(Agent::Claude));
+        assert_eq!(identify_agent("qlaude-2.1.296"), Some(Agent::Claude));
+        assert_eq!(
+            identify_agent("/home/user/.qlaude/qlaude-2.1.296"),
+            Some(Agent::Claude)
+        );
+        assert_eq!(
+            identify_agent(r"C:\Users\user\.qlaude\qlaude-2.1.296.exe"),
+            Some(Agent::Claude)
+        );
     }
 
     #[test]
@@ -1143,6 +1165,8 @@ mod tests {
         assert_eq!(identify_agent("muse-bin"), None);
         assert_eq!(identify_agent("muse-bin-"), None);
         assert_eq!(identify_agent("muse-binary"), None);
+        assert_eq!(identify_agent("qlaude-"), None);
+        assert_eq!(identify_agent("qlaude-plugin"), None);
     }
 
     #[test]
