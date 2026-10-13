@@ -280,9 +280,36 @@ pub(crate) fn terminal_grid_size() -> std::io::Result<(u16, u16)> {
     Ok((cols, rows))
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn launch_server_daemon_command(command: &mut std::process::Command) -> std::io::Result<u32> {
     command.spawn().map(|child| child.id())
+}
+
+/// Starts the daemon through launchd, so quitting the terminal app that
+/// started it does not take the server down (herdr#4920). Over SSH, or when
+/// launchd cannot carry the command exactly, it spawns a detached child.
+/// Returns the child's pid, or 0 when launchd started it.
+#[cfg(target_os = "macos")]
+pub fn launch_server_daemon_command(command: &mut std::process::Command) -> std::io::Result<u32> {
+    match macos::spawn_launchd_job(command) {
+        Ok(()) => Ok(0),
+        Err(err) => {
+            tracing::info!(%err, "starting the server directly instead of through launchd");
+            command.spawn().map(|child| child.id())
+        }
+    }
+}
+
+/// First step of a server process; see `launch_server_daemon_command`.
+/// Returns a warning to log once logging is initialized.
+#[cfg(target_os = "macos")]
+pub(crate) fn leave_launcher_job() -> Option<String> {
+    macos::leave_launchd_job()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn leave_launcher_job() -> Option<String> {
+    None
 }
 
 #[cfg(not(target_os = "macos"))]

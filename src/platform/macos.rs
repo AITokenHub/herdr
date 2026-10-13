@@ -29,6 +29,9 @@ pub(crate) use bootstrap::{configure_server_daemon_context, prepare_server_proce
 mod shutdown;
 pub(crate) use shutdown::monitor_host_shutdown;
 
+mod launchd_spawn;
+pub(crate) use launchd_spawn::{leave_launchd_job, spawn_launchd_job};
+
 #[cfg(test)]
 mod config_file_tests;
 
