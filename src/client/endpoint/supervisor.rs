@@ -382,7 +382,6 @@ fn connect_once(
                 profile.id.as_str(),
                 &profile.target,
                 &profile.session,
-                generation,
                 Arc::clone(&cancelled),
             )?;
             (connected.stream, Box::new(connected.bridge))

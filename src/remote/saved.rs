@@ -21,7 +21,6 @@ pub(crate) fn connect_saved_ssh(
     profile_id: &str,
     target: &str,
     session: &str,
-    generation: u64,
     cancelled: Arc<AtomicBool>,
 ) -> io::Result<SavedSshStream> {
     let mut ssh = validated_saved_ssh(profile_id, target, session)?;
@@ -31,7 +30,7 @@ pub(crate) fn connect_saved_ssh(
     if cancelled.load(Ordering::Acquire) {
         return Err(super::process::cancelled());
     }
-    let path = saved_bridge_path(profile_id, generation);
+    let path = saved_bridge_path(profile_id);
     let bridge = SshStdioBridge::start(
         target.to_owned(),
         remote_herdr,
@@ -162,10 +161,10 @@ pub(crate) fn saved_ssh_failure_needs_attention(error: &io::Error) -> bool {
     .any(|needle| message.contains(needle))
 }
 
-fn saved_bridge_path(profile_id: &str, generation: u64) -> PathBuf {
+fn saved_bridge_path(profile_id: &str) -> PathBuf {
     let pid = std::process::id();
-    let readable = format!("herdr-ssh-{pid}-{profile_id}-{generation:x}.sock");
-    let short = format!("herdr-s-{pid}-{}-{generation:x}.sock", &profile_id[..16]);
+    let readable = format!("herdr-ssh-{pid}-{profile_id}.sock");
+    let short = format!("herdr-s-{pid}-{}.sock", &profile_id[..16]);
     crate::platform::remote_bridge_endpoint_path(&readable, &short)
 }
 
@@ -196,32 +195,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn retiring_old_bridge_does_not_remove_or_block_replacement_listener() {
-        use interprocess::local_socket::traits::Listener as _;
-        use std::io::{Read as _, Write as _};
-        let profile = "0123456789abcdef0123456789abcdef";
-        let first = saved_bridge_path(profile, 1);
-        let second = saved_bridge_path(profile, 2);
-        let old = SshStdioBridge::start_command(
-            "unused".into(),
-            "unused".into(),
-            first.clone(),
-            None,
-            true,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .unwrap();
-        let replacement = crate::ipc::bind_private_local_listener(&second).unwrap();
-        drop(old);
-        assert!(!first.exists());
-        let mut client = crate::ipc::connect_local_stream(&second).unwrap();
-        let mut server = replacement.accept().unwrap();
-        client.write_all(b"replacement").unwrap();
-        let mut bytes = [0; 11];
-        server.read_exact(&mut bytes).unwrap();
-        assert_eq!(&bytes, b"replacement");
-        drop(replacement);
-        std::fs::remove_file(second).unwrap();
+    fn bridge_paths_use_profile_identity_not_target_or_session() {
+        let first = saved_bridge_path("0123456789abcdef0123456789abcdef");
+        let second = saved_bridge_path("fedcba9876543210fedcba9876543210");
+        assert_ne!(first, second);
+        assert!(!first.to_string_lossy().contains("example.com"));
+        assert!(!first.to_string_lossy().contains("default"));
     }
 
     #[test]

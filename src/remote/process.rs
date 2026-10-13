@@ -16,19 +16,6 @@ pub(super) fn cancelled() -> io::Error {
 
 pub(super) struct OwnedSshChild(pub(super) Child);
 
-impl std::ops::Deref for OwnedSshChild {
-    type Target = Child;
-    fn deref(&self) -> &Child {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for OwnedSshChild {
-    fn deref_mut(&mut self) -> &mut Child {
-        &mut self.0
-    }
-}
-
 impl Drop for OwnedSshChild {
     fn drop(&mut self) {
         // Only this SSH invocation is ours; a multiplex master may serve other sessions.
