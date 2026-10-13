@@ -721,10 +721,21 @@ mod tests {
             assert!(completed.load(Ordering::Acquire));
             assert!(!supervisors.record_status(&endpoint_id, generation, status, now));
             peer.set_nonblocking(true).unwrap();
-            assert!(matches!(
-                crate::ipc::poll_local_stream_read_count(&mut peer, &mut [0; 1]).unwrap(),
-                crate::ipc::LocalStreamReadCount::Closed
-            ));
+            // Windows interprocess drops flush through its background linger pool.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if matches!(
+                    crate::ipc::poll_local_stream_read_count(&mut peer, &mut [0; 1]).unwrap(),
+                    crate::ipc::LocalStreamReadCount::Closed
+                ) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "cancelled attempt retained its stream"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
             supervisors.host_power_event(InteractiveResume, now);
             supervisors.spawn_due(now, connect_options(), &events);
             let replacement = supervisors.endpoints[&ClientEndpointId::Local].generation;
