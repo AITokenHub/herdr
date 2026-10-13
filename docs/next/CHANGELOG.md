@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.9.4] - 2026-10-13
+
 ### Added
 - `herdr plugin update` updates plugins installed from GitHub, all at once or by name. Running plugin panes keep working on their old files, and new runs pick up the update without a config reload. Locally linked plugins are left alone. (#4245, thanks @JJLiebig)
 - Windows notifications stay in Notification Center. Clicking one jumps to its pane and brings the terminal window forward. (#4773, #4803, thanks @JJLiebig)
