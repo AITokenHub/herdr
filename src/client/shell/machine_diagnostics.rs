@@ -51,6 +51,19 @@ fn machine_diagnostic_code(profile_id: &impl std::fmt::Display) -> String {
 }
 
 impl ClientShellState {
+    pub(crate) fn receive_machine_unavailable(
+        &mut self,
+        id: &ClientEndpointId,
+        message: String,
+    ) -> bool {
+        self.push_endpoint_notice(
+            ClientEndpointNoticeKind::Unavailable,
+            format!("machine-unavailable:{}:{message}", id.storage_key()),
+            "Endpoint unavailable",
+            message,
+        )
+    }
+
     pub(crate) fn set_machine_diagnostic(&mut self, id: &ClientEndpointId, message: String) {
         if !id.is_local() {
             self.machine_diagnostics.errors.insert(
@@ -82,13 +95,12 @@ impl ClientShellState {
         {
             return false;
         }
-        // A visible diagnostic describes the attempt this retry replaces.
+        // Clear the selected machine's diagnostic or active disconnect notice.
         let code = machine_diagnostic_code(profile_id);
-        if self
-            .visible_endpoint_notice
-            .as_ref()
-            .is_some_and(|notice| notice.key.code == code)
-        {
+        let unavailable = format!("machine-unavailable:{}:", id.storage_key());
+        if self.visible_endpoint_notice.as_ref().is_some_and(|notice| {
+            notice.key.code == code || notice.key.code.starts_with(&unavailable)
+        }) {
             self.visible_endpoint_notice = None;
         }
         if !self.machine_diagnostics.retry_requests.contains(id) {
@@ -104,10 +116,12 @@ impl ClientShellState {
     }
 
     /// Reports a failed connection attempt when the user asked for it.
-    pub(crate) fn report_machine_retry(&mut self, id: &ClientEndpointId) {
-        if self.machine_diagnostics.retry_reports.remove(id) {
+    pub(crate) fn report_machine_retry(&mut self, id: &ClientEndpointId) -> bool {
+        let requested = self.machine_diagnostics.retry_reports.remove(id);
+        if requested {
             self.show_machine_diagnostic(id);
         }
+        requested
     }
 
     pub(super) fn handle_machine_badge_event(

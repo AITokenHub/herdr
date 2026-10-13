@@ -57,7 +57,12 @@ impl ClientShellState {
         };
         let endpoint_id = hit.endpoint_id.clone();
         let collapse_toggle = super::contains(hit.collapse_toggle, point);
-        if collapse_toggle || endpoint_id == self.active_endpoint_id {
+        if collapse_toggle
+            || (endpoint_id == self.active_endpoint_id
+                && (endpoint_id.is_local()
+                    || self.endpoint_is_online(&endpoint_id)
+                    || self.endpoint_status(&endpoint_id) == Some(ClientEndpointStatus::Disabled)))
+        {
             if !self.collapsed_endpoints.remove(&endpoint_id) {
                 self.collapsed_endpoints.insert(endpoint_id.clone());
             }
