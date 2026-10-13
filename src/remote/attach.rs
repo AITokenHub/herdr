@@ -2173,7 +2173,7 @@ fn probe_remote_endpoint(
         ssh.session_name.clone(),
         ssh.options(),
         true,
-        Arc::clone(&ssh.cancelled),
+        Arc::new(AtomicBool::new(false)),
     )?;
     let mut stream = crate::ipc::connect_local_stream(&path)?;
     // Use the saved client's noninteractive path. This metadata-only attachment never
@@ -4250,6 +4250,15 @@ mod tests {
         assert!(
             marker.exists(),
             "endpoint probe discarded the authenticated setup's SSH options: {error}"
+        );
+        fs::remove_file(&marker).unwrap();
+        let output = ssh
+            .framed_user_shell_output("unused")
+            .expect("probe teardown must leave setup commands usable");
+        assert!(!output.status.success());
+        assert!(
+            marker.exists(),
+            "setup must still reach SSH after probe teardown"
         );
     }
 
